@@ -39,7 +39,7 @@ jobs:
       - name: Install WDK
         run: choco install windowsdriverkit11 -y
 
-      - name: SDK detection and UMDF version
+      - name: SDK detection and Environment setup
         shell: pwsh
         run: |
           $regKey = "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots"
@@ -51,73 +51,57 @@ jobs:
           $includePath = Join-Path $kitsRoot "Include"
           $sdkDirs = Get-ChildItem -Path $includePath -Directory | Where-Object { $_.Name -match "^10\." } | Sort-Object { [version]$_.Name } -Descending
           
+          # 1. Detect highest complete SDK for Windows.h
           $sdkVersion = ""
-          $iddcxMinor = ""
           foreach ($dir in $sdkDirs) {
-            $iddcxBase = Join-Path $dir.FullName "um\iddcx"
-            if (Test-Path $iddcxBase) {
+            if (Test-Path (Join-Path $dir.FullName "um\Windows.h")) {
               $sdkVersion = $dir.Name
-              # Find highest IddCx version subfolder (e.g., "1.10", "1.4", "1.0")
-              $versions = Get-ChildItem -Path $iddcxBase -Directory | Where-Object { $_.Name -match "^1\." } | Sort-Object { [version]$_.Name } -Descending
-              if ($versions) {
-                $iddcxMinor = $versions[0].Name.Split('.')[1]
-                break
-              }
+              break
             }
           }
           
           if (-not $sdkVersion) {
-            Write-Warning "SDK with IddCx not found. Falling back to highest SDK."
-            foreach ($dir in $sdkDirs) {
-              $windowsH = Join-Path $dir.FullName "um\Windows.h"
-              if (Test-Path $windowsH) {
-                $sdkVersion = $dir.Name
-                break
-              }
-            }
-          }
-
-          if (-not $sdkVersion) {
-            Write-Error "Valid Windows SDK not found."
+            Write-Error "No valid Windows SDK found."
             exit 1
           }
-          
           Write-Output "Selected SDK Version: $sdkVersion"
           echo "SDK_VERSION=$sdkVersion" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          if ($iddcxMinor) {
-             Write-Output "Detected IddCx Version: 1.$iddcxMinor"
-             echo "IDDCX_VERSION_MINOR=$iddcxMinor" | Out-File -FilePath $env:GITHUB_ENV -Append
-          }
-          
+          # 2. Detect UMDF version
           $umdf2PathVersioned = Join-Path $includePath "$sdkVersion\wdf\umdf"
           $umdf2PathUnversioned = Join-Path $includePath "wdf\umdf"
-          
           $umdfDirs = @()
-          if (Test-Path $umdf2PathVersioned) {
-             $umdfDirs += Get-ChildItem -Path $umdf2PathVersioned -Directory | Where-Object { $_.Name -match "^2\." }
-          }
-          if (Test-Path $umdf2PathUnversioned) {
-             $umdfDirs += Get-ChildItem -Path $umdf2PathUnversioned -Directory | Where-Object { $_.Name -match "^2\." }
-          }
-          
+          if (Test-Path $umdf2PathVersioned) { $umdfDirs += Get-ChildItem -Path $umdf2PathVersioned -Directory | Where-Object { $_.Name -match "^2\." } }
+          if (Test-Path $umdf2PathUnversioned) { $umdfDirs += Get-ChildItem -Path $umdf2PathUnversioned -Directory | Where-Object { $_.Name -match "^2\." } }
           $highestUmdf = $umdfDirs | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
-          if (-not $highestUmdf) {
-            Write-Error "UMDF 2.xx directory not found."
-            exit 1
+          if ($highestUmdf) {
+            $umdfMinor = $highestUmdf.Name.Split('.')[1]
+            Write-Output "UMDF_VERSION_MINOR=$umdfMinor"
+            echo "UMDF_VERSION_MINOR=$umdfMinor" | Out-File -FilePath $env:GITHUB_ENV -Append
           }
-          
-          $umdfMinor = $highestUmdf.Name.Split('.')[1]
-          Write-Output "UMDF_VERSION_MINOR=$umdfMinor"
-          echo "UMDF_VERSION_MINOR=$umdfMinor" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # 3. Find IddCx headers and libs
+          $iddcxHeader = Get-ChildItem -Path "$kitsRoot\Include" -Filter "IddCx.h" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($iddcxHeader) {
+            $iddcxIncDir = Split-Path $iddcxHeader.FullName -Parent
+            Write-Output "Found IddCx.h in: $iddcxIncDir"
+            echo "EXTERNAL_INCLUDE=$iddcxIncDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+          $iddcxLib = Get-ChildItem -Path "$kitsRoot\Lib" -Filter "IddCx.lib" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match "x64" } | Select-Object -First 1
+          if ($iddcxLib) {
+            $iddcxLibDir = Split-Path $iddcxLib.FullName -Parent
+            Write-Output "Found IddCx.lib in: $iddcxLibDir"
+            echo "EXTERNAL_LIB=$iddcxLibDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
 
       - name: Build Driver
+        shell: pwsh
         run: |
-          $iddcx_arg = ""
-          if ($env:IDDCX_VERSION_MINOR) {
-            $iddcx_arg = "/p:IDDCX_VERSION_MINOR=$env:IDDCX_VERSION_MINOR"
-          }
-          msbuild "Virtual Display Driver (HDR)/MttVDD.sln" /m /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:WindowsTargetPlatformVersion=${{ env.SDK_VERSION }} /p:UMDF_VERSION_MINOR=${{ env.UMDF_VERSION_MINOR }} $iddcx_arg /p:EnableInfVerif=false /p:RunApiValidator=false
+          if ($env:EXTERNAL_INCLUDE) { $env:INCLUDE = "$env:EXTERNAL_INCLUDE;$env:INCLUDE" }
+          if ($env:EXTERNAL_LIB) { $env:LIB = "$env:EXTERNAL_LIB;$env:LIB" }
+          
+          msbuild "Virtual Display Driver (HDR)/MttVDD.sln" /m /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:WindowsTargetPlatformVersion=${{ env.SDK_VERSION }} /p:UMDF_VERSION_MINOR=${{ env.UMDF_VERSION_MINOR }} /p:EnableInfVerif=false /p:RunApiValidator=false
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
