@@ -1,19 +1,21 @@
-name: Build Virtual Display Driver
+name: CI Validation
 
 on:
-  pull_request:
-    branches: [ main, master ]
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
     paths-ignore:
-      - '**.md'
+      - '**/*.md'
       - 'docs/**'
-      - 'LICENSE*'
+  pull_request:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
   workflow_dispatch:
-
-env:
-  BUILD_CONFIGURATION: Release
-  VDD_SOLUTION: Virtual Display Driver (HDR)/MttVDD.sln
 
 permissions:
   contents: read
@@ -24,121 +26,76 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [x64, ARM64]
+        platform: [x64]
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Install Windows Driver Kit (IddCx headers)
+      - name: Install WDK
+        run: choco install windowsdriverkit11 -y
+
+      - name: SDK detection and UMDF version
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          choco install windowsdriverkit11 -y --no-progress
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Detect Windows SDK (windows.h)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $kitsRoot = $null
-          try {
-            $kitsRoot = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Name "KitsRoot10" -ErrorAction Stop).KitsRoot10
-          } catch {
-            $kitsRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\"
+          $regKey = "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots"
+          $kitsRoot = (Get-ItemProperty -Path $regKey -Name "KitsRoot10" -ErrorAction SilentlyContinue).KitsRoot10
+          if (-not $kitsRoot) {
+            $kitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
           }
-
-          if (-not $kitsRoot -or -not (Test-Path $kitsRoot)) {
-            throw "Windows Kits root not found: $kitsRoot"
+          
+          $includePath = Join-Path $kitsRoot "Include"
+          $sdkDirs = Get-ChildItem -Path $includePath -Directory | Where-Object { $_.Name -match "^10\." } | Sort-Object { [version]$_.Name } -Descending
+          
+          $sdkVersion = ""
+          foreach ($dir in $sdkDirs) {
+            $windowsH = Join-Path $dir.FullName "um\Windows.h"
+            if (Test-Path $windowsH) {
+              $sdkVersion = $dir.Name
+              break
+            }
           }
-
-          $includeRoot = Join-Path $kitsRoot "Include"
-          if (-not (Test-Path $includeRoot)) {
-            throw "Windows Kits Include directory not found: $includeRoot"
+          
+          if (-not $sdkVersion) {
+            Write-Error "Valid Windows SDK not found."
+            exit 1
           }
-
-          $best =
-            Get-ChildItem -Path $includeRoot -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
-            Where-Object { Test-Path (Join-Path $_.FullName "um\Windows.h") } |
-            Sort-Object -Property Name -Descending |
-            Select-Object -First 1
-
-          if (-not $best) {
-            throw "Could not find an SDK version directory containing um\\Windows.h under: $includeRoot"
+          Write-Output "Selected SDK Version: $sdkVersion"
+          
+          $umdf2PathVersioned = Join-Path $includePath "$sdkVersion\wdf\umdf"
+          $umdf2PathUnversioned = Join-Path $includePath "wdf\umdf"
+          
+          $umdfDirs = @()
+          if (Test-Path $umdf2PathVersioned) {
+             $umdfDirs += Get-ChildItem -Path $umdf2PathVersioned -Directory | Where-Object { $_.Name -match "^2\." }
           }
-
-          $sdkVersion = $best.Name
-          Write-Output "Using WindowsSdkDir: $kitsRoot"
-          Write-Output "Using WindowsTargetPlatformVersion: $sdkVersion"
-          "WINDOWS_SDK_DIR=$kitsRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "WINDOWS_TARGET_PLATFORM_VERSION=$sdkVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Build VDD (${{ matrix.platform }})
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $sln = "${{ env.VDD_SOLUTION }}"
-          if (-not (Test-Path $sln)) { throw "VDD solution file not found at: $sln" }
-
-          # Pick an available UMDF WDF header version on the runner.
-          # Kits can be laid out either versioned:
-          #   Include\<sdk>\wdf\umdf\2.xx
-          # or unversioned:
-          #   Include\wdf\umdf\2.xx
-          $umdfRoots = @(
-            (Join-Path $env:WINDOWS_SDK_DIR ("Include\" + $env:WINDOWS_TARGET_PLATFORM_VERSION + "\wdf\umdf")),
-            (Join-Path $env:WINDOWS_SDK_DIR "Include\wdf\umdf")
-          ) | Where-Object { Test-Path $_ }
-
-          if (-not $umdfRoots -or $umdfRoots.Count -eq 0) {
-            throw "UMDF WDF include root not found under $env:WINDOWS_SDK_DIR (tried versioned + unversioned layouts)"
+          if (Test-Path $umdf2PathUnversioned) {
+             $umdfDirs += Get-ChildItem -Path $umdf2PathUnversioned -Directory | Where-Object { $_.Name -match "^2\." }
           }
+          
+          $highestUmdf = $umdfDirs | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+          if (-not $highestUmdf) {
+            Write-Error "UMDF 2.xx directory not found."
+            exit 1
+          }
+          
+          $umdfMinor = $highestUmdf.Name.Split('.')[1]
+          Write-Output "UMDF_VERSION_MINOR=$umdfMinor"
+          echo "UMDF_VERSION_MINOR=$umdfMinor" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          $umdfBest =
-            $umdfRoots |
-            ForEach-Object { Get-ChildItem -Path $_ -Directory -ErrorAction SilentlyContinue } |
-            Where-Object { $_.Name -match '^\d+\.\d+$' } |
-            Sort-Object -Property Name -Descending |
-            Select-Object -First 1
+      - name: Build Driver
+        run: msbuild "Virtual Display Driver (HDR)/MttVDD.sln" /m /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:UMDF_VERSION_MINOR=${{ env.UMDF_VERSION_MINOR }} /p:EnableInfVerif=false /p:RunApiValidator=false
 
-          if (-not $umdfBest) { throw "No UMDF version directories found under: $($umdfRoots -join ', ')" }
-
-          $umdfMinor = ($umdfBest.Name -split '\.')[1]
-          Write-Output "Using UMDF version: $($umdfBest.Name) (minor=$umdfMinor) from $($umdfBest.FullName)"
-
-          msbuild $sln `
-            /m `
-            /t:Build `
-            /p:Configuration="${{ env.BUILD_CONFIGURATION }}" `
-            /p:Platform="${{ matrix.platform }}" `
-            /p:WindowsSdkDir="$env:WINDOWS_SDK_DIR" `
-            /p:WindowsTargetPlatformVersion="$env:WINDOWS_TARGET_PLATFORM_VERSION" `
-            /p:UMDF_VERSION_MINOR="$umdfMinor" `
-            /p:EnableInfVerif=false `
-            /p:RunApiValidator=false `
-            /verbosity:minimal
-
-      - name: Collect outputs
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $outDir = "Virtual Display Driver (HDR)\${{ matrix.platform }}\${{ env.BUILD_CONFIGURATION }}\MttVDD"
-          if (-not (Test-Path $outDir)) { throw "Build output directory not found: $outDir" }
-
-          $dest = "artifacts\VDD\${{ matrix.platform }}"
-          New-Item -ItemType Directory -Path $dest -Force | Out-Null
-          Copy-Item "$outDir\*" -Destination $dest -Recurse -Force
-
-      - name: Upload artifacts
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: VDD-${{ matrix.platform }}-${{ env.BUILD_CONFIGURATION }}
-          path: artifacts/VDD/${{ matrix.platform }}/
-          if-no-files-found: error
-
+          name: VDD-${{ matrix.platform }}-Release
+          path: |
+            Virtual Display Driver (HDR)/${{ matrix.platform }}/Release/MttVDD/**
+            Virtual Display Driver (HDR)/${{ matrix.platform }}/Release/*.sys
+            Virtual Display Driver (HDR)/${{ matrix.platform }}/Release/*.inf
+            Virtual Display Driver (HDR)/${{ matrix.platform }}/Release/*.cat
+            Virtual Display Driver (HDR)/${{ matrix.platform }}/Release/*.cer
