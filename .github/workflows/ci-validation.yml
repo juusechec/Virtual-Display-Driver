@@ -67,7 +67,29 @@ jobs:
           Write-Output "Selected SDK Version: $sdkVersion"
           echo "SDK_VERSION=$sdkVersion" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          # 2. Detect UMDF version
+          # 2. Fix IddCx paths (HACK for runner environment)
+          $targetIddCxDir = "$includePath\$sdkVersion\um\iddcx\1.10"
+          if (-not (Test-Path $targetIddCxDir)) {
+            $sourceIddCx = Get-ChildItem -Path "$kitsRoot\Include" -Filter "IddCx.h" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($sourceIddCx) {
+              $sourceDir = Split-Path $sourceIddCx.FullName -Parent
+              Write-Output "Copying IddCx headers from $sourceDir to $targetIddCxDir"
+              New-Item -ItemType Directory -Force -Path $targetIddCxDir
+              Copy-Item -Path "$sourceDir\*" -Destination $targetIddCxDir -Recurse -Force
+            }
+          }
+          
+          $targetIddCxLibDir = "$kitsRoot\Lib\$sdkVersion\um\x64"
+          $sourceIddCxLib = Get-ChildItem -Path "$kitsRoot\Lib" -Filter "IddCx.lib" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match "x64" } | Select-Object -First 1
+          if ($sourceIddCxLib -and (Test-Path $targetIddCxLibDir)) {
+             $sourceLibDir = Split-Path $sourceIddCxLib.FullName -Parent
+             if ($sourceLibDir -ne $targetIddCxLibDir) {
+                Write-Output "Copying IddCx.lib from $sourceLibDir to $targetIddCxLibDir"
+                Copy-Item -Path "$sourceLibDir\IddCx.lib" -Destination $targetIddCxLibDir -Force
+             }
+          }
+
+          # 3. Detect UMDF version
           $umdf2PathVersioned = Join-Path $includePath "$sdkVersion\wdf\umdf"
           $umdf2PathUnversioned = Join-Path $includePath "wdf\umdf"
           $umdfDirs = @()
@@ -80,28 +102,8 @@ jobs:
             echo "UMDF_VERSION_MINOR=$umdfMinor" | Out-File -FilePath $env:GITHUB_ENV -Append
           }
 
-          # 3. Find IddCx headers and libs
-          $iddcxHeader = Get-ChildItem -Path "$kitsRoot\Include" -Filter "IddCx.h" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($iddcxHeader) {
-            $iddcxIncDir = Split-Path $iddcxHeader.FullName -Parent
-            Write-Output "Found IddCx.h in: $iddcxIncDir"
-            echo "EXTERNAL_INCLUDE=$iddcxIncDir" | Out-File -FilePath $env:GITHUB_ENV -Append
-          }
-
-          $iddcxLib = Get-ChildItem -Path "$kitsRoot\Lib" -Filter "IddCx.lib" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match "x64" } | Select-Object -First 1
-          if ($iddcxLib) {
-            $iddcxLibDir = Split-Path $iddcxLib.FullName -Parent
-            Write-Output "Found IddCx.lib in: $iddcxLibDir"
-            echo "EXTERNAL_LIB=$iddcxLibDir" | Out-File -FilePath $env:GITHUB_ENV -Append
-          }
-
       - name: Build Driver
-        shell: pwsh
-        run: |
-          if ($env:EXTERNAL_INCLUDE) { $env:INCLUDE = "$env:EXTERNAL_INCLUDE;$env:INCLUDE" }
-          if ($env:EXTERNAL_LIB) { $env:LIB = "$env:EXTERNAL_LIB;$env:LIB" }
-          
-          msbuild "Virtual Display Driver (HDR)/MttVDD.sln" /m /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:WindowsTargetPlatformVersion=${{ env.SDK_VERSION }} /p:UMDF_VERSION_MINOR=${{ env.UMDF_VERSION_MINOR }} /p:EnableInfVerif=false /p:RunApiValidator=false
+        run: msbuild "Virtual Display Driver (HDR)/MttVDD.sln" /m /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:WindowsTargetPlatformVersion=${{ env.SDK_VERSION }} /p:UMDF_VERSION_MINOR=${{ env.UMDF_VERSION_MINOR }} /p:EnableInfVerif=false /p:RunApiValidator=false
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
