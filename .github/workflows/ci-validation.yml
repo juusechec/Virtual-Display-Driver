@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [x64]
+        platform: [x64, ARM64]
 
     steps:
       - name: Checkout repository
@@ -86,9 +86,10 @@ jobs:
           $umdfMinor = $highestUmdf.Name.Split('.')[1]
           Write-Output "UMDF_VERSION_MINOR=$umdfMinor"
           echo "UMDF_VERSION_MINOR=$umdfMinor" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "SDK_VERSION=$sdkVersion" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build Driver
-        run: msbuild "Virtual Display Driver (HDR)/MttVDD.sln" /m /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:UMDF_VERSION_MINOR=${{ env.UMDF_VERSION_MINOR }} /p:EnableInfVerif=false /p:RunApiValidator=false
+        run: msbuild "Virtual Display Driver (HDR)/MttVDD.sln" /m /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:WindowsTargetPlatformVersion=${{ env.SDK_VERSION }} /p:UMDF_VERSION_MINOR=${{ env.UMDF_VERSION_MINOR }} /p:EnableInfVerif=false /p:RunApiValidator=false
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
